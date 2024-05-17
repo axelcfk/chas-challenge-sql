@@ -24,13 +24,11 @@ const movieAPI_KEY = "4e3dec59ad00fa8b9d1f457e55f8d473";
 
 // connect to DB
 const pool = mysql.createPool({
-  // host: "mysql",
-  host: "localhost",
-  user: "root",
-  password: "root",
-  database: "movie-app",
-  port: 3306,
-  //port: 8889 || 3306,
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  port: 8889 || 3306,
 });
 
 function generateOTP() {
@@ -50,63 +48,6 @@ app.use(bodyParser.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 // const apiKey = process.env.movieAPI_KEY;
-
-app.post("/joke", async (req, res) => {
-  //Tar emot input från frontend och storear i userQuery
-  const userQuery = req.body.input;
-
-  try {
-    const completion = await openai.chat.completions.create({
-      model: "gpt-3.5-turbo",
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a mental health coach only. You should not respond to anything that is not related to mental health, guidence, gratitude and life goals. If the user asks about anything else you should respond with a message explaining that you are not created to answer that question.",
-        },
-        {
-          role: "user",
-          content:
-            userQuery ||
-            "Please provide a short daily reflection, around 100 words, on an aspect of gratitude. Focus on different subjects each time, such as interactions, personal achievements, or everyday blessings.",
-        },
-      ],
-    });
-
-    console.log("OpenAI API Response:", JSON.stringify(completion, null, 2));
-
-    //Här ligger meddelandet man får från open api
-    const result = completion.choices[0].message.content;
-
-    //skickar result tillbaka till frontend
-    res.json({ joke: result });
-
-    // STORING USERQUERY AND AIRESPONSE TO MYSQL
-    const user_id = 1; // PLACEHOLDER USER_ID
-    try {
-      // create an empty account (0 kr) for the user, with the user_id attached to it
-      const userQueryAndResponseSQLData = await query(
-        "INSERT INTO chatgpt (user_id, user_query, ai_response) VALUES (?, ?, ?)",
-        [user_id, userQuery, result]
-      );
-      console.log("userQuerySQLData: ", userQueryAndResponseSQLData[0]);
-    } catch (error) {
-      console.error(
-        "Error saving user query and ai response to mysql: ",
-        error
-      );
-      return res
-        .status(500)
-        .send("Error saving user query and ai response to mysql");
-    }
-  } catch (error) {
-    console.error("Error:", error);
-    res.status(500).json({
-      error: "Unable to fetch a joke at this time.",
-      details: error.message,
-    });
-  }
-});
 
 //CREATE ACCOUNT
 app.post("/users", async (req, res) => {
@@ -162,10 +103,12 @@ app.post("/sessions", async (req, res) => {
         const token = generateOTP();
         console.log("Generated Token:", token);
 
-        await query("INSERT INTO sessions (user_id, token) VALUES (?, ?)", [
-          userData.id,
-          token,
-        ]);
+        const expirationTime = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes from now
+
+        await query(
+          "INSERT INTO sessions (user_id, token, expires_at) VALUES (?, ?, ?)",
+          [userData.id, token, expirationTime]
+        );
         res.json({ message: "Login successful", token, userId: userData.id });
       } else {
         console.log("Invalid password");
@@ -180,6 +123,40 @@ app.post("/sessions", async (req, res) => {
     res.status(500).send("Error logging in user");
   }
 });
+
+///
+async function isAuthenticated(req, res, next) {
+  const token = req.headers.authorization?.split(" ")[1];
+
+  if (!token) {
+    return res
+      .status(401)
+      .json({ message: "Access denied. No token provided" });
+  }
+  try {
+    const session = await query("SELECT * FROM sessions WHERE token = ?", [
+      token,
+    ]);
+    if (session.length === 0) {
+      return res.status(401).json({ message: "Access denied. Invalid token" });
+    }
+
+    const currentTime = new Date();
+    const sessionExpiryTime = new Date(session[0].expires_at);
+
+    if (currentTime > sessionExpiryTime) {
+      return res
+        .status(401)
+        .json({ message: "Session expired. Please log in again." });
+    }
+
+    req.user = session[0];
+    next();
+  } catch (error) {
+    console.error("Error verifying session:", error);
+    res.status(500).json({ message: "Internal server error." });
+  }
+}
 
 //let movieIds = [];
 
@@ -455,9 +432,9 @@ app.get("/fetchedProvidersOfMovie", (req, res) => {
 });
 
 app.post("/addmovieproviderstodatabase", (req, res) => {
-  try {
-    const { movieProvidersObject } = req.body;
+  const { movieProvidersObject } = req.body;
 
+  try {
     if (!movieProvidersObject) {
       return res
         .status(400)
@@ -479,65 +456,64 @@ app.post("/addmovieproviderstodatabase", (req, res) => {
 
 // WHEN USING THIS FUNCTION, set movieProvidersObject = 0 if SE has no provider...
 // e.g. addProvidersOfMovieToDatabase(0, id)
-function addProvidersOfMovieToDatabase(movieProvidersObject) {
+async function addProvidersOfMovieToDatabase(movieProvidersObject) {
   if (!movieProvidersObject) {
     console.log(
-      "movie providers object or id not provided when attempting to add to our database."
+      "Movie providers object or id not provided when attempting to add to our database."
     );
-    return; //exit code // TODO: ändra att den returnerar något annat? typ error?
+    return { error: "Movie providers object or id not provided." };
   }
 
-  const idExistsAlready = fetchedProvidersOfMovie.some(
-    (fetchedMovie) => fetchedMovie.id === movieProvidersObject.id
-  );
-  /*  const idExistsInSeries = fetchedSeries.some(
-    (fetchedSerie) => fetchedSerie.id === movieObject.id
-  ); */
+  try {
+    const movieId = movieProvidersObject.id;
 
-  if (idExistsAlready) {
-    console.log(
-      "Providers of movie ID ",
-      movieProvidersObject.id,
-      " has already been fetched."
+    // Check if providers for this movie ID already exist in the database
+    const result = await query(
+      "SELECT id FROM fetched_movie_providers WHERE  id = ?",
+      [movieId]
     );
-    return; // TODO: return nothing?
-  } else {
-    // fortsätt kod...
-  }
 
-  /* if (data.results.SE) {
-      addProvidersOfMovieToDatabase(data.results.SE, id);
+    if (result.length > 0) {
+      console.log(
+        "Providers of movie ID",
+        movieId,
+        "have already been fetched."
+      );
+      return { message: "Providers already exist." };
+    }
 
-      return data.results.SE;
-    } else if (!data.results.SE) {
-      console.log("No providers in sweden for movie id ", id);
-      addProvidersOfMovieToDatabase(0, id);
+    let movieProvidersData;
 
-      return { noProviders: "no providers in sweden", id };
+    if (!movieProvidersObject.results?.SE) {
+      // No providers in Sweden
+      movieProvidersData = JSON.stringify({
+        noProviders: "no providers in Sweden",
+        id: movieId,
+      });
     } else {
-      console.log("failed to fetch providers of movie from TMDB");
-    } */
-  //
-  if (!movieProvidersObject.results?.SE) {
-    // TODO: check
-    fetchedProvidersOfMovie.push({
-      noProviders: "no providers in sweden",
-      id: movieProvidersObject.id,
-    });
-  } else {
-    // added movie id to the object so it is easier to find later...
-    const movieProvidersObjectWithID = {
-      ...movieProvidersObject.results.SE,
-      id: movieProvidersObject.id,
-    };
+      // Providers in Sweden
+      movieProvidersData = JSON.stringify({
+        ...movieProvidersObject.results.SE,
+        id: movieId,
+      });
+    }
 
-    // One movie is an array of two objects, one object movie's providers and the other object is just the id of the movie
-    fetchedProvidersOfMovie.push(movieProvidersObjectWithID); // UPDATE LATER TO SQL
-    console.log(
-      "Added providers of movie ID ",
-      movieProvidersObject.id,
-      " into array fetchedProvidersOfMovie"
+    // Update the providers column for the specific movie ID
+    await query(
+      "INSERT INTO fetched_movie_providers (id, data) VALUES (?, ?)",
+      [movieId, movieProvidersData]
     );
+
+    console.log(
+      "Added providers of movie ID",
+      movieId,
+      "into fetched_movies table"
+    );
+
+    return { message: "Providers added to the database." };
+  } catch (error) {
+    console.error("Error adding providers to database:", error);
+    return { error: "Internal server error" };
   }
 }
 
@@ -772,11 +748,12 @@ function getProvidersOfMOvieObjectOurDatabase(id) {
   return searchResult;
 }
 
-app.post("/addmovietodatabase", async (req, res) => {
-  try {
-    //console.log("/addmovietodatabase req.body: ", req.body);
-    const { movie, movieOrSeries } = req.body;
+//////////////////////ADD MOVIE TO DATABASE //////////////////////////////////
 
+app.post("/addmovietodatabase", async (req, res) => {
+  const { movie, movieOrSeries } = req.body;
+
+  try {
     if (!movie.id || !movieOrSeries) {
       return res.status(400).json({
         error:
@@ -784,44 +761,64 @@ app.post("/addmovietodatabase", async (req, res) => {
       });
     }
 
-    const idExistsInMovies = fetchedMovies.some(
-      (fetchedMovie) => fetchedMovie.id === movie.id
-    );
-    const idExistsInSeries = fetchedSeries.some(
-      (fetchedSerie) => fetchedSerie.id === movie.id
-    );
+    // Check if the movie or series already exists in the fetched_movies or fetched_series tables
+    let idExistsInMovies;
+    let idExistsInSeries;
 
-    if (idExistsInMovies || idExistsInSeries) {
+    if (movieOrSeries === "movie") {
+      idExistsInMovies = await query(
+        "SELECT id FROM fetched_movies WHERE JSON_EXTRACT(data, '$.id') = ?",
+        [movie.id]
+      );
+    } else if (movieOrSeries === "series") {
+      idExistsInSeries = await query(
+        "SELECT id FROM fetched_series WHERE JSON_EXTRACT(data, '$.id') = ?",
+        [movie.id]
+      );
+    }
+
+    if (
+      (idExistsInMovies && idExistsInMovies.length > 0) ||
+      (idExistsInSeries && idExistsInSeries.length > 0)
+    ) {
       console.log("movie/series ID ", movie.id, " has already been fetched.");
       return res.status(200).json({
         message: "Liked movie OR Liked series has already been fetched.",
       });
-    } else {
-      // om redan finns?
     }
 
+    // Insert the movie or series into the appropriate table
     if (movieOrSeries === "movie") {
-      // maybe change to some sort of True/False variable instead...
-      fetchedMovies.push(movie); // UPDATE LATER TO SQL
-      console.log("Added movie ID ", movie.id, " to fetchedMovies");
+      await query("INSERT INTO fetched_movies (data) VALUES (?)", [
+        JSON.stringify(movie),
+      ]);
+      console.log("Added movie ID ", movie.id, " to fetched_movies");
     } else if (movieOrSeries === "series") {
-      fetchedSeries.push(movie); // UPDATE LATER TO SQL
-      console.log("Added series ID ", movie.id, " to fetchedSeries");
+      await query("INSERT INTO fetched_series (data) VALUES (?)", [
+        JSON.stringify(movie),
+      ]);
+      console.log("Added series ID ", movie.id, " to fetched_series");
     } else {
       console.log("Could not determine if movie or series");
+      return res.status(400).json({
+        error: "Could not determine if movie or series",
+      });
     }
 
     res.status(201).json({
-      message: "Movie/Series saved to fetchedMovies/fetchedSeries",
+      message: "Movie/Series saved to fetched_movies/fetched_series",
     });
   } catch (error) {
     console.error(
-      "1:Error adding movie/series to fetchedMovie/fetchedSeries:",
+      "1:Error adding movie/series to fetched_movies/fetched_series:",
       error
     );
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+////////////////////////////////////////////////////////
+
 let likedMoviesList = []; // TA BORT NÄR VI HAR FIXAT MYSQL
 let likedSeriesList = []; // TA BORT NÄR VI HAR FIXAT MYSQL
 let movieWatchList = []; // TA BORT NÄR VI HAR FIXAT MYSQL
@@ -1127,18 +1124,51 @@ const latestSuggestions = [];
 const latestUserQuery = [];
 
 app.post("/moviesuggest2", async (req, res) => {
-  const likedMovieTitles = likedMoviesList.map((movie) => {
-    return movie.title;
-  });
+  const { token, query: userQuery } = req.body;
+
+  if (!token || !userQuery) {
+    return res.status(400).json({ error: "Token and query are required" });
+  }
+
+  let sessionSearchResult;
+  try {
+    // Use the token to find the current session (user_id that is logged in)
+    sessionSearchResult = await query(
+      "SELECT * FROM sessions WHERE token = ?",
+      [token]
+    );
+  } catch (error) {
+    console.error("Error finding session", error);
+    return res.status(500).send("Error finding session");
+  }
+
+  if (sessionSearchResult.length === 0) {
+    return res.status(401).json({ error: "Invalid session token" });
+  }
+
+  const currentSession = sessionSearchResult[0];
+  const currentUserId = currentSession.user_id;
+
+  let likedMovies;
+  try {
+    likedMovies = await query(
+      "SELECT movie_id FROM liked_movies WHERE user_id = ?",
+      [currentUserId]
+    );
+  } catch (error) {
+    console.error("Error fetching liked movies:", error);
+    return res.status(500).send("Error fetching liked movies");
+  }
+
+  const likedMovieTitles = likedMovies.map((movie) => movie.title);
 
   console.log("likedMovieTitles: ", likedMovieTitles);
 
   const likedMovieTitlesString = likedMovieTitles.join(", ");
   console.log("likedMovieTitlesString: ", likedMovieTitlesString);
-  const userQuery = req.body.query;
   latestUserQuery.push(userQuery);
   if (latestUserQuery.length > 15) {
-    latestSuggestions.pop(); // tar bort den sista
+    latestUserQuery.pop(); // Remove the oldest one if the length exceeds 15
   }
   console.log("Received user query:", userQuery);
 
@@ -1186,7 +1216,19 @@ If you have no suggestions, explain in your response. Also, look inside ${latest
 
     const suggestion = completion.choices[0].message.content;
 
-    // TODO: spara ner userQuery och suggestion i backend?
+    // Save the query and suggestions to the database
+    try {
+      await query(
+        "INSERT INTO chatgpt (user_id, user_query, ai_response) VALUES (?, ?, ?)",
+        [currentUserId, userQuery, suggestion]
+      );
+      console.log("Search query and suggestions saved to database");
+    } catch (dbError) {
+      console.error(
+        "Error saving search query and suggestions to database:",
+        dbError
+      );
+    }
 
     console.log("Suggestion structure:", suggestion);
     console.log("suggested movie list:", latestSuggestions);
@@ -1197,8 +1239,9 @@ If you have no suggestions, explain in your response. Also, look inside ${latest
     if (movieNames.length === 6) {
       latestSuggestions.unshift(movieNames);
       if (latestSuggestions.length > 36) {
-        latestSuggestions.pop(); // tar bort den sista
+        latestSuggestions.pop(); // Remove the oldest one if the length exceeds 36
       }
+
       res.json({ movieNames });
     } else {
       res.json({ suggestion });
@@ -1206,13 +1249,9 @@ If you have no suggestions, explain in your response. Also, look inside ${latest
         "Failed to extract Movie Names from AI response:",
         suggestion
       );
-
-      // res.status(500).json({
-      //   error: "Failed to extract Movie Names from AI response",
-      // });
     }
   } catch (error) {
-    console.error("Error in /moviesuggest endpoint:", error);
+    console.error("Error in /moviesuggest2 endpoint:", error);
     res.status(500).json({
       error: "Unable to process the movie suggestion at this time.",
       details: error.message,
@@ -1934,13 +1973,14 @@ app.post("/me/seenlists/removefromseenlist", async (req, res) => {
     seenMoviesList = seenMoviesList.filter((movie) => movie.id !== id);
     console.log(`Removed movie ID ${id} from seen list`);
 
-    res.status(200).json({ message: "Movie removed from seen list successfully" });
+    res
+      .status(200)
+      .json({ message: "Movie removed from seen list successfully" });
   } catch (error) {
     console.error("Error removing movie from seen list:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
-
 
 //retrieve the seen movies list
 app.get("/me/seenlists", (req, res) => {
